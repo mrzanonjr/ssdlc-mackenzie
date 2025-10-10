@@ -1,0 +1,320 @@
+name: 🔒 Security Scan Pipeline
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+  # schedule:
+  #   # Executa diariamente às 2h da manhã (ambiente produtivo)
+  #   - cron: '0 2 * * *'
+  workflow_dispatch: # Permite execução manual
+
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '18'
+  MAVEN_OPTS: -Xmx1024m
+
+jobs:
+  # ==========================================
+  # JOB 1: Secret Scanning
+  # ==========================================
+  secret-scanning:
+    name: 🔑 Secret & Credentials Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Histórico completo para análise
+      
+      - name: 🕵️ GitLeaks - Detectar Secrets (Scan Completo)
+        run: |
+          echo "🔍 Executando GitLeaks com scan completo do código..."
+          docker run --rm \
+            -v ${{ github.workspace }}:/repo \
+            zricethezav/gitleaks:latest \
+            detect \
+            --source="/repo" \
+            --config="/repo/.gitleaks.toml" \
+            --report-path="/repo/gitleaks-report.json" \
+            --report-format=json \
+            --no-git \
+            --verbose || echo "⚠️ Secrets detectados!"
+        continue-on-error: true # Remover em ambiente produtivo!
+      
+      
+      - name: 📊 Upload GitLeaks Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ==========================================
+  # JOB 2: Backend Security (Java/Maven)
+  # ==========================================
+  backend-security:
+    name: 🛡️ Backend Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+      
+      - name: 🔨 Build Backend
+        run: |
+          cd backend
+          mvn clean compile -DskipTests
+      
+      - name: 🛡️ OWASP Dependency-Check
+        run: |
+         cd backend
+         mvn org.owasp:dependency-check-maven:check \
+           -DfailBuildOnCVSS=7 \
+           -DsuppressionFile=dependency-check-suppressions.xml
+        continue-on-error: true # Remover em ambiente produtivo!
+      
+      - name: 📊 Upload OWASP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-dependency-check-report
+          path: backend/target/dependency-check-report.html
+          retention-days: 30
+      
+
+  # ==========================================
+  # JOB 3: Frontend Security (Vue/Node)
+  # ==========================================
+  frontend-security:
+    name: 🌐 Frontend Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: 📥 Install Dependencies
+        run: |
+          cd frontend
+          npm ci
+      
+      - name: 🔍 npm audit - Vulnerabilidades
+        run: |
+          cd frontend
+          npm audit --audit-level=moderate --json > npm-audit-report.json || true
+          npm audit --audit-level=moderate || true
+        continue-on-error: true # Remover em ambiente produtivo!
+      
+      - name: 📊 Upload npm audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: frontend/npm-audit-report.json
+          retention-days: 30
+          if-no-files-found: ignore
+      
+
+  # ==========================================
+  # JOB 4: SAST - Análise Estática de Código
+  # ==========================================
+  sast-analysis:
+    name: 🔬 SAST - Static Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: 🎯 CodeQL Analysis - Init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, java
+          queries: security-extended
+        continue-on-error: true # Remover em ambiente produtivo!
+      
+      - name: 🔨 Build para CodeQL
+        run: |
+          cd backend
+          mvn clean compile -DskipTests
+      
+      - name: 🔍 Executar CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript,java"
+          upload: false
+          output: sarif-results
+        continue-on-error: true # Remover em ambiente produtivo!
+      
+      - name: 📊 Upload CodeQL Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-results
+          path: sarif-results
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ==========================================
+  # JOB 5: DAST - Dynamic Application Security Testing
+  # ==========================================
+  dast-scan:
+    name: 🌐 DAST - Dynamic Scan
+    runs-on: ubuntu-latest
+    needs: [backend-security, frontend-security]
+    #if: github.event_name == 'workflow_dispatch' # Apenas execução manual
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: 🚀 Iniciar Backend
+        run: |
+          cd backend
+          mvn spring-boot:run &
+          sleep 30
+          curl -f http://localhost:8080/users/search?name=test || exit 0
+      
+      - name: 🚀 Iniciar Frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run serve &
+          sleep 30
+      
+      - name: 🕷️ OWASP ZAP Scan
+        uses: zaproxy/action-full-scan@v0.9.0
+        with:
+          target: 'http://localhost:3000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+          allow_issue_writing: false
+        continue-on-error: true # Remover em ambiente produtivo!
+      
+      - name: 📊 Upload ZAP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-report
+          path: |
+            report_html.html
+            report_json.json
+          retention-days: 30
+
+  # ==========================================
+  # JOB 6: Compliance & License Check
+  # ==========================================
+  compliance-check:
+    name: 📋 Compliance & License Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+      
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ========================
+      # Backend (Maven - Java)
+      # ========================
+      - name: ⚖️ License Compliance (Backend - Licenses)
+        run: |
+          cd backend
+          echo "📋 Gerando relatório de licenças (Maven)..."
+          mvn org.codehaus.mojo:license-maven-plugin:2.4.0:download-licenses -DoutputDirectory=target/generated-sources/licenses
+          mv target/generated-sources/licenses/licenses.xml ../licenses-backend.xml || true
+        continue-on-error: true
+
+      - name: 📦 Gerar SBOM (Backend - CycloneDX)
+        run: |
+          cd backend
+          echo "📦 Gerando SBOM (CycloneDX para Maven)..."
+          mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.10:makeAggregateBom
+          mv target/bom.json ../sbom-backend.json || true
+        continue-on-error: true
+
+      # ========================
+      # Frontend (Node.js - NPM)
+      # ========================
+      - name: ⚖️ License Compliance (Frontend - Licenses)
+        run: |
+          cd frontend
+          echo "📋 Gerando relatório de licenças (NPM)..."
+          npm install --legacy-peer-deps
+          npx license-checker --json > ../licenses-frontend.json || true
+        continue-on-error: true
+
+      - name: 📦 Gerar SBOM (Frontend - CycloneDX)
+        run: |
+          cd frontend
+          echo "📦 Gerando SBOM (CycloneDX para NPM)..."
+          npx @cyclonedx/cyclonedx-npm --output-file ../sbom-frontend.json || true
+        continue-on-error: true
+
+      # ========================
+      # Upload dos relatórios
+      # ========================
+      - name: 📊 Upload Compliance Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-reports
+          path: |
+            licenses-backend.xml
+            licenses-frontend.json
+            sbom-backend.json
+            sbom-frontend.json
+          retention-days: 30
+          if-no-files-found: ignore
